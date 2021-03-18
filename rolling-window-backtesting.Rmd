@@ -1,0 +1,176 @@
+---
+title: "Rolling Window Backtesting"
+author: "Alex Kong"
+date: "3/15/2021"
+output: rmarkdown::github_document
+always_allow_html: true
+---
+
+```{r}
+# Important reference:
+# https://cran.r-project.org/web/packages/portfolioBacktest/vignettes/PortfolioBacktest.html
+library(portfolioBacktest)
+data("SP500_symbols")
+#SP500 <- stockDataDownload(stock_symbols = SP500_symbols,
+#                           from = "2007-01-01",
+#                           to = "2008-12-31")
+
+load("stockdata_from_2010-01-01_to_2020-12-31_(065fe3c9e1991cd1ec13c8d1c18d3e2c).RData")
+SP500 <- stockdata
+my_dataset_list <- financialDataResample(
+                      SP500, 
+                      N_sample = 50,
+                      T_sample = 252 * 4, # Desired length of each resample
+                      num_datasets = 10)
+
+#head(my_dataset_list$`dataset 1`, n = 2)
+```
+```{r}
+#head(my_dataset_list$`dataset 3`, n = 2)
+```
+
+```{r}
+library(pracma)
+library(nsprcomp)
+ema_cross_fun <- function(dataset) {
+  
+  ema_s <- apply(X = dataset$adjusted, MARGIN = 2, movavg, n = 252/12, type = "e")
+  ema_l <- apply(X = dataset$adjusted, MARGIN = 2, movavg, n = 252/2 - 1, type = "e")
+  TT <- nrow(dataset$adjusted)
+  N <- ncol(dataset$adjusted)
+  
+  diff <- (ema_l[TT,] - ema_s[TT,])
+  diff[diff > 0] <- 1
+  diff[diff < 0] <- 0
+  w <- rep(1/cardinality(diff), N)
+  w <- diff * w
+  return(w)
+}
+
+# define quintile portfolio
+quintile_portfolio_fun <- function(dataset) {
+  X <- diff(log(dataset$adjusted))[-1]  # compute log returns
+  N <- ncol(X)
+  # design quintile portfolio
+  ranking <- sort(colMeans(X), decreasing = TRUE, index.return = TRUE)$ix
+  w <- rep(0, N)
+  w[ranking[1:round(N/5)]] <- 1/round(N/5)
+  return(w)
+}
+
+# define GMVP (with heuristic not to allow shorting)
+GMVP_portfolio_fun <- function(dataset) {
+  X <- diff(log(dataset$adjusted))[-1]  # compute log returns
+  Sigma <- cov(X)  # compute SCM
+  # design GMVP
+  w <- solve(Sigma, rep(1, nrow(Sigma)))
+  w <- abs(w)/sum(abs(w))
+  return(w)
+}
+
+# define Markowitz mean-variance portfolio
+library(CVXR)
+Markowitz_portfolio_fun <- function(dataset) {
+  X <- diff(log(dataset$adjusted))[-1]  # compute log returns
+  mu <- colMeans(X)  # compute mean vector
+  Sigma <- cov(X)  # compute the SCM
+  # design mean-variance portfolio
+  w <- Variable(nrow(Sigma))
+  prob <- Problem(Maximize(t(mu) %*% w - 0.5*quad_form(w, Sigma)),
+                  constraints = list(w >= 0, sum(w) == 1))
+  result <- solve(prob)
+  return(as.vector(result$getValue(w)))
+}
+
+```
+
+```{r}
+portfolios <- list("Quintile"  = quintile_portfolio_fun,
+                   "GMVP"      = GMVP_portfolio_fun,
+                   "Markowitz" = Markowitz_portfolio_fun,
+                   "EMA"       = ema_cross_fun)
+bt <- portfolioBacktest(portfolio_funs = portfolios, 
+                        dataset_list = my_dataset_list,
+                        benchmark = c("uniform", "index"),
+                        T_rolling_window = 252/2,
+                        rebalance_every = 10,
+                        optimize_every = 30,
+                        paral_datasets = 2,
+                        show_progress_bar = FALSE, # Does not work in Rstudio
+                        cost = list(buy = 0.003,
+                                    sell = 0.003,
+                                    short = 0.01,
+                                    long_leverage = 0.01))
+res <- backtestSelector(bt, portfolio_name = "EMA")
+# information of 1st error
+#error1 <- res$error_message[[1]]
+#str(error1)
+
+```
+```{r}
+backtestTable(bt, measures = c("Sharpe ratio", "max drawdown"))
+res_sum <- backtestSummary(bt)
+names(res_sum)
+#> [1] "performance_summary" "error_message"
+
+res_sum$performance_summary
+
+summaryTable(res_sum, type = "DT", order_col = "Sharpe ratio", order_dir = "desc")
+summaryBarPlot(res_sum, measures = c("Sharpe ratio", "max drawdown"))
+backtestBoxPlot(bt, measure = "Sharpe ratio")
+```
+## Cumulative Returns {.tabset}
+
+### Dataset 1
+
+```{r}
+backtestChartCumReturns(bt = bt, dataset_num = 1)
+```
+
+### Dataset 2
+
+```{r}
+backtestChartCumReturns(bt = bt, dataset_num = 2)
+```
+
+### Dataset 3
+
+```{r}
+backtestChartCumReturns(bt = bt, dataset_num = 3)
+```
+
+## {-}
+
+## Maximum Drawdown {.tabset}
+
+### Dataset 1
+
+```{r}
+backtestChartDrawdown(bt = bt, dataset_num = 1)
+```
+
+### Dataset 2
+
+```{r}
+backtestChartDrawdown(bt = bt, dataset_num = 2)
+```
+
+### Dataset 3
+
+```{r}
+backtestChartDrawdown(bt = bt, dataset_num = 3)
+```
+
+## {-}
+
+```{r eval = FALSE}
+# for better illustration, let's use only the first 5 stocks
+my_dataset_list_10stocks <- lapply(my_dataset_list, 
+                            function(x) {x$adjusted <- x$adjusted[, 1:20]; return(x)})
+# backtest
+bt <- portfolioBacktest(list("EMA" = ema_cross_fun), my_dataset_list_10stocks, 
+                        rebalance_every = 30,
+                        optimize_every = 30,
+                        T_rolling_window = 252/2)
+backtestChartStackedBar(bt, "EMA", legend = TRUE)
+```
