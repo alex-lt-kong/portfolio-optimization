@@ -1,0 +1,282 @@
+---
+title: "Portfolio Optimization Practice"
+author: "Alex Kong"
+date: "3/5/2021"
+output: rmarkdown::github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = TRUE, message = TRUE)
+```
+
+```{r message=FALSE}
+
+library(xts)  # to manipulate time series of stock data
+library(quantmod)  # to download stock data
+library(PerformanceAnalytics)  # to compute performance measures
+library(CVXR)
+#library(psych) 
+```
+### Portfolio Optimization 1
+```{r message=FALSE}
+
+stock_namelist <- c('MSFT', 'AAPL', 'AMZN', 'FB', 'GOOG', 'GOOGL', 'JNJ', 'JPM', 
+                 'V', 'PG', 'T', 'UNH', 'MA', 'HD', 'INTC', 'VZ', 'KO', 'BAC',
+                 'XOM', 'MRK', 'DIS', 'PFE', 'PEP', 'CMCSA', 'CVX', 'ADBE',
+                 'CSCO', 'NVDA', 'WMT', 'NFLX', 'CRM', 'WFC', 'MCD', 'ABT',
+                 'BMY', 'COST', 'BA', 'C', 'PM', 'NEE', 'MDT', 'ABBV', 'AMGN',
+                 'TMO', 'LLY', 'HON', 'ACN', 'IBM')
+prices <- xts()
+for (i in 1:length(stock_namelist)) {
+  tmp <- Ad(getSymbols(Symbols = stock_namelist[i], from = "2014-01-01",
+                       to = "2020-12-31", auto.assign = FALSE))
+  tmp <- na.approx(tmp, na.rm = FALSE)  # interpolate NAs
+ # tmp <- na.approx(tmp, na.rm = TRUE)  # interpolate NAs
+  prices <- cbind(prices, tmp)
+}
+colnames(prices) <- stock_namelist
+tclass(prices) <- "Date"
+
+head(x = prices, n = 2)
+tail(x = prices, n = 2)
+
+# compute log-returns and linear returns
+#X_log <- diff(log(prices))[-1]
+#X_lin <- (prices/lag(prices) - 1)[-1]
+# or alternatively...
+X_log <- CalculateReturns(prices, "log")[-1]
+X_lin <- CalculateReturns(prices)[-1]
+
+N <- ncol(X_log)  # number of stocks
+TT <- nrow(X_log)  # number of days
+#T is a reserved keyword...
+
+T_trn <- round(0.75*TT)  # 75% of data
+X_log_trn <- X_log[1:T_trn, ]
+X_log_tst <- X_log[(T_trn+1):TT, ]
+X_lin_trn <- X_lin[1:T_trn, ]
+X_lin_tst <- X_lin[(T_trn+1):TT, ]
+```
+### Portfolio Optimization 2
+```{r}
+mu_hat <- colMeans(X_log_trn, na.rm = TRUE)
+# Note that according to the prof.'s lecture slides, we use linear returns to
+# compute performance but we use log return to estimate mu.
+Sigma_hat_trn <- cov(X_log_trn)
+Sigma_hat_tst <- cov(X_log_tst)
+
+w_EWP <- rep(1/N, N)
+names(w_EWP) <- colnames(X_lin)
+
+# create function for IVP
+IVP <- function(Sigma) {
+  sigma <- sqrt(diag(Sigma))
+  w <- 1/sigma
+  w <- w/sum(w)
+  return(w)
+}
+
+# this function can now be used as
+w_IVP <- IVP(Sigma_hat_trn)
+
+i1 <- sort(mu_hat, decreasing = TRUE, index.return = TRUE)$ix
+i2 <- sort(mu_hat/diag(Sigma_hat_trn), decreasing = TRUE, index.return = TRUE)$ix
+i3 <- sort(mu_hat/sqrt(diag(Sigma_hat_trn)), decreasing = TRUE, index.return = TRUE)$ix
+
+# create portfolios
+w_QuintP_1 <- w_QuintP_2 <- w_QuintP_3 <- rep(0, N)
+w_QuintP_1[i1[1:round(N/5)]] <- 1/round(N/5)
+w_QuintP_2[i2[1:round(N/5)]] <- 1/round(N/5)
+w_QuintP_3[i3[1:round(N/5)]] <- 1/round(N/5)
+w_QuintP <- cbind("QuintP (mu)"        = w_QuintP_1, 
+                  "QuintP (mu/sigma2)" = w_QuintP_2, 
+                  "QuintP (mu/sigma)"  = w_QuintP_3)
+rownames(w_QuintP) <- colnames(X_lin)
+#w_QuintP
+
+w_heuristic <- cbind("EWP" = w_EWP, w_QuintP, "IVP" = w_IVP)
+
+# compute returns of all portfolios
+ret_heuristic <- xts(X_lin %*% w_heuristic, order.by = index(X_lin))
+# X_lin or X_log? This code is from page 88 of lec3_portfolio-optimization.html
+
+ret_heuristic_trn <- ret_heuristic[1:T_trn, ]
+ret_heuristic_tst <- ret_heuristic[-c(1:T_trn), ]
+
+# performance
+t(table.AnnualizedReturns(ret_heuristic_trn))
+
+chart.CumReturns(R = ret_heuristic_tst,
+                 main = "Cumulative return of heuristic portfolios\n(test only)", 
+                 wealth.index = TRUE, legend.loc = "topleft",
+                 colorset = rich8equal)
+
+chart.Drawdown(ret_heuristic_tst, main = "Drawdown of portfolios (out-of-sample)", 
+               legend.loc = "bottomleft", colorset = rich10equal)
+```
+
+### Portfolio Optimization 3
+
+```{r}
+# create function for GMVP
+GMVP <- function(Sigma) {
+  w <- Variable(nrow(Sigma))
+  prob <- Problem(Minimize(quad_form(w, Sigma)),
+                  constraints = list(w >= 0, sum(w) == 1))
+  result <- solve(prob)
+  w <- as.vector(result$getValue(w))
+  names(w) <- colnames(Sigma)
+  return(w)
+}
+
+fn_SR <- function(w) {
+  return(as.numeric(t(w) %*% mu_hat / sqrt(t(w) %*% Sigma_hat_tst %*% w)))
+}
+
+#Sigma_hat_trn <- Sigma
+for (rho in seq(from = 0, to = 1, by = 0.2)) {
+  w <- Variable(cols = N)
+  Sigma <- rho * Sigma_hat_trn + (1 - rho) * sum(diag(Sigma_hat_trn)) * diag(N) / N
+  w_GMVP <- GMVP(Sigma)
+  ret_GMVP <- xts(X_lin_tst %*% w_GMVP, index(X_lin_tst))
+#  print(paste0("rho: ", rho, ", w_GMWP:", round(fn_SR(w_GMVP), 10)))
+  print(SharpeRatio(ret_GMVP))
+}
+```
+
+### Portfolio Optimization 4
+```{r}
+M <- 10
+
+Sigma1  <- (1 - 1)  / (M - 1) * Sigma_hat_trn + (M - 1)  / (M - 1) * (sum(diag(Sigma_hat_trn)) * diag(N)) / (N)
+Sigma2  <- (2 - 1)  / (M - 1) * Sigma_hat_trn + (M - 2)  / (M - 1) * (sum(diag(Sigma_hat_trn)) * diag(N)) / (N)
+Sigma3  <- (3 - 1)  / (M - 1) * Sigma_hat_trn + (M - 3)  / (M - 1) * (sum(diag(Sigma_hat_trn)) * diag(N)) / (N)
+Sigma4  <- (4 - 1)  / (M - 1) * Sigma_hat_trn + (M - 4)  / (M - 1) * (sum(diag(Sigma_hat_trn)) * diag(N)) / (N)
+Sigma5  <- (5 - 1)  / (M - 1) * Sigma_hat_trn + (M - 5)  / (M - 1) * (sum(diag(Sigma_hat_trn)) * diag(N)) / (N)
+Sigma6  <- (6 - 1)  / (M - 1) * Sigma_hat_trn + (M - 6)  / (M - 1) * (sum(diag(Sigma_hat_trn)) * diag(N)) / (N)
+Sigma7  <- (7 - 1)  / (M - 1) * Sigma_hat_trn + (M - 7)  / (M - 1) * (sum(diag(Sigma_hat_trn)) * diag(N)) / (N)
+Sigma8  <- (8 - 1)  / (M - 1) * Sigma_hat_trn + (M - 8)  / (M - 1) * (sum(diag(Sigma_hat_trn)) * diag(N)) / (N)
+Sigma9  <- (9 - 1)  / (M - 1) * Sigma_hat_trn + (M - 9)  / (M - 1) * (sum(diag(Sigma_hat_trn)) * diag(N)) / (N)
+Sigma10 <- (10 - 1) / (M - 1) * Sigma_hat_trn + (M - 10) / (M - 1) * (sum(diag(Sigma_hat_trn)) * diag(N)) / (N)
+Sigma10
+for (λ in c(0, 1, 4, 10, 20)) {
+  w <- Variable(cols = N)
+  obj <- -t(mu_hat) %*% w + λ * max(quad_form(w, Sigma1), quad_form(w, Sigma1),
+                                    quad_form(w, Sigma3), quad_form(w, Sigma4),
+                                    quad_form(w, Sigma5), quad_form(w, Sigma6),
+                                    quad_form(w, Sigma7), quad_form(w, Sigma8),
+                                    quad_form(w, Sigma9), quad_form(w, Sigma10))
+  constraints <- list(w >= 0, sum(w) == 1)
+  prob <- Problem(Minimize(obj), constraints)
+  result <- solve(prob)
+  if (result$status != "optimal") {
+    print("WARNING: result not optimal!")
+  }
+  w <- as.vector(result$getValue(w))
+  ret <- xts(X_lin %*% w, index(X_lin))
+  # Note that according to the prof.'s lecture slides, we use linear returns to
+  # compute performance but we use log return to estimate mu.
+  ret_test <- ret[-c(1:T_trn), ]
+  
+  
+  print(paste0("λ: ",  λ, 
+              ", Annualized return: ", round(Return.annualized(ret_test, geometric = FALSE), digits = 4),
+              ", Average drawdown: ", round(AverageDrawdown(ret_test), digits = 4)))
+  print(SharpeRatio(ret_test))
+}
+
+```
+### Gradient Descent
+#### Common 
+```{r eval = TRUE}
+stock_namelist <- c("MSFT", "AAPL", "AMZN", "FB", "GOOG")
+N <- length(stock_namelist)
+start_date <- "2016-01-01"
+
+x <- xts()
+f <- xts()
+for (i in 1:N) {
+  tmp <- Ad(getSymbols(Symbols = stock_namelist[i], from = start_date, to = "2019-12-31", auto.assign = FALSE))
+  tmp <- na.approx(tmp, na.rm = FALSE)  # interpolate NAs
+  x <- cbind(x, tmp)
+}
+f <- Ad(getSymbols(Symbols = "^GSPC", from = start_date, to = "2019-12-31", auto.assign = FALSE))
+f <- na.approx(f, na.rm = FALSE)  # interpolate NAs
+x_log <- diff(log(x))[-1]
+f_log <- diff(log(f))[-1]
+```
+
+#### CVXR
+```{r eval = TRUE}
+alpha <- Variable(N)
+beta <- Variable(N)
+
+x_log_mat <- as.matrix(x_log)
+f_log_vec <- as.vector(f_log)
+N <- ncol(x_log_mat)
+TT <- nrow(x_log_mat)
+I <- matrix(data = rep(1, TT), nrow = 1, ncol = TT)
+obj <- sum((t(x_log_mat) - alpha %*% I - beta %*% t(f_log_vec))^2)
+# This is the R way
+
+#obj <- sum((as.vector(x_log[1]) - alpha - beta * as.vector(f_log[1]))^2)
+#for (t in 2:length(f_log)) {
+#  obj <- obj + sum((as.vector(x_log[t]) - alpha - beta * as.vector(f_log[t]))^2)
+#}
+# This is the CS way, will be very slow in R
+
+prob <- Problem(Minimize(obj))
+result <- solve(prob)
+result$getValue(alpha)
+result$getValue(beta)
+
+```
+
+### Gradient Descent
+```{r eval = TRUE}
+
+alpha <- c(10, 10, 10, 10, 10)
+beta <- c(10, 10, 10, 10, 10)
+aplha_chg <- 0.0000002
+beta_chg <- 0.2
+dx <- 0.0005
+
+capm <- function(alpha, beta) {
+  return(  sum((t(x_log_mat) - alpha%*%I - beta%*%t(f_log_vec))^2)  )
+}
+
+alpha_new <- alpha
+beta_new <- beta
+  
+counter <- 0
+while (counter < 1000 * 1000) {
+  capm_val <- capm(alpha,beta) 
+  
+  for(i in 1:N){
+    alpha_tmp <- alpha
+    alpha_tmp[i] <- alpha[i] + dx
+    capm_tmp <- capm(alpha_tmp, beta)
+    diff <- (capm_tmp - capm_val) / dx
+    alpha_new[i] <- alpha[i] - diff * aplha_chg
+
+    beta_tmp <- beta
+    beta_tmp[i] <- beta[i] + dx
+    capm_tmp <- capm(alpha, beta_tmp)
+    diff <- (capm_tmp - capm_val) / dx
+    beta_new[i] <- beta[i] - diff * beta_chg
+    }
+  
+  capm_val_new <- capm(alpha_new,beta_new)
+  alpha <- alpha_new
+  beta <- beta_new
+  
+  if (abs(capm_val_new - capm_val) < 1e-10) {
+    break
+  }
+  counter <- counter + 1
+}
+alpha
+beta
+
+
+```
